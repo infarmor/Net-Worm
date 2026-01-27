@@ -6,7 +6,7 @@ echo " Wooly C2 SERVER v5.0 - PENTEST INFRASTRUCTURE"
 echo " Authorization confirmed for enterprise pentest"
 
 # Get public IP
-PUBLIC_IP="170.168.15.88"
+PUBLIC_IP=""
 echo " C2 Server IP: $PUBLIC_IP"
 
 # Install dependencies
